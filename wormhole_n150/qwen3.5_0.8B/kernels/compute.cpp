@@ -39,10 +39,12 @@ constexpr uint32_t c_qd = 0, c_nkd = 1, c_kb = 2, c_v = 3, c_d = 4, c_w = 5, c_r
                    c_out = 24, c_oblk = 25, c_ss = 26, c_ssp = 27, c_tmp2 = 29, c_tmp3 = 30;
 
 constexpr uint32_t KT = 4, KX = 32, X_CHUNK = 4, P_TILES = 5, CONV_TILES = 3, N_OUT = 32, GROUP = 4;
-// layer constants (bf16): conv diag [shift s][channel tile ct] -> s*3+ct, norm-weight diag -> 12
-constexpr uint32_t L_NORM = 12, N_LCONST = 13;
-// global constants (fp32): identity, ones column, ones row, a selector, b selector
-constexpr uint32_t G_ID = 0, G_ONES_COL = 1, G_ONES_ROW = 2, G_SEL_A = 3, G_SEL_B = 4;
+// layer constants (bf16): conv diag [shift s][channel tile ct] -> s*3+ct. The RMSNorm weight is folded into
+// this core's out_proj rows on the host.
+constexpr uint32_t N_LCONST = 12;
+// global constants (fp32): identity, ones column, reduce selector (row r <- every row j with j % BP == r),
+// a selector, b selector
+constexpr uint32_t G_ID = 0, G_ONES_COL = 1, G_SEL_RED = 2, G_SEL_A = 3, G_SEL_B = 4;
 
 constexpr uint32_t F_ONE = 0x3f800000;
 constexpr uint32_t F_TWENTY = 0x41a00000;
@@ -67,6 +69,7 @@ inline void copy_init(uint32_t cb) {
 
 void kernel_main() {
     constexpr uint32_t B = get_compile_time_arg_val(0);
+    constexpr uint32_t BP = get_compile_time_arg_val(1);
     const uint32_t dt_bias = get_arg_val<uint32_t>(0);
     const uint32_t neg_A = get_arg_val<uint32_t>(1);
     const uint32_t qk_scale2 = get_arg_val<uint32_t>(2);
@@ -122,51 +125,88 @@ void kernel_main() {
     }
 
     // ---- C1: conv + SiLU -------------------------------------------------------------------------
+    { DeviceZoneScopedN("CONV");
 #ifdef WEIGHTS_IN_DRAM
     cb_wait_front(c_lconst, N_LCONST);
 #endif
     cb_wait_front(c_xs, 3 * CONV_TILES);
     cb_reserve_back(c_qkloc, 2);
     cb_reserve_back(c_cv, 1);
+    // all 12 tap matmuls under one init (DST ct = channel tile ct), then SiLU on the three
+    mm_init(c_p, c_lconst);
+    tile_regs_acquire();
     for (uint32_t ct = 0; ct < CONV_TILES; ++ct) {
-        mm_init(c_p, c_lconst);
-        tile_regs_acquire();
-        matmul_tiles(c_p, c_lconst, ct, ct, 0);
-        for (uint32_t s = 1; s <= 3; ++s) {
-            matmul_tiles(c_xs, c_lconst, (s - 1) * CONV_TILES + ct, s * CONV_TILES + ct, 0);
-        }
-        silu_tile_init();
-        silu_tile(0);
-        pack_one(ct < 2 ? c_qkloc : c_cv);
+        matmul_tiles(c_p, c_lconst, ct, ct, ct);
     }
+    for (uint32_t s = 1; s <= 3; ++s) {
+        for (uint32_t ct = 0; ct < CONV_TILES; ++ct) {
+            matmul_tiles(c_xs, c_lconst, (s - 1) * CONV_TILES + ct, s * CONV_TILES + ct, ct);
+        }
+    }
+    silu_tile_init();
+    for (uint32_t ct = 0; ct < CONV_TILES; ++ct) {
+        silu_tile(ct);
+    }
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, c_qkloc);
+    pack_tile(1, c_qkloc);
+    pack_tile(2, c_cv);
+    tile_regs_release();
     cb_push_back(c_qkloc, 2);
     cb_push_back(c_cv, 1);
     cb_pop_front(c_xs, 3 * CONV_TILES);
 
-    // ---- C2: row sums over the full head ---------------------------------------------------------
-    cb_wait_front(c_qkfull, 2 * KT);  // [q0..q3][k0..k3]
-    cb_reserve_back(c_scal, 5);
-    for (uint32_t g = 0; g < 3; ++g) {  // |q|^2, |k|^2, q.k  (column 0)
-        const uint32_t a0 = g == 1 ? KT : 0, b0 = g == 0 ? 0 : KT;
-        cb_reserve_back(c_tmp, KT);
-        reconfig_data_format(c_qkfull, c_qkfull);
-        mul_init(c_qkfull, c_qkfull);
-        for (uint32_t i = 0; i < KT; ++i) {
-            tile_regs_acquire();
-            mul_tiles(c_qkfull, c_qkfull, a0 + i, b0 + i, 0);
-            pack_one(c_tmp);
-        }
-        cb_push_back(c_tmp, KT);
-        cb_wait_front(c_tmp, KT);
-        mm_init(c_tmp, c_gconst);
-        tile_regs_acquire();
-        for (uint32_t i = 0; i < KT; ++i) {
-            matmul_tiles(c_tmp, c_gconst, i, G_ONES_COL, 0);
-        }
-        pack_one(c_scal);
-        cb_pop_front(c_tmp, KT);
     }
-    mm_init(c_p, c_gconst);  // a, b of this core's head -> column 0
+    // ---- C2: row sums over the full head ---------------------------------------------------------
+    { DeviceZoneScopedN("QK_NORM");
+    {
+        DeviceZoneScopedN("QK_SWAP_WAIT");
+        cb_wait_front(c_qkfull, 2 * KT);  // [q0..q3][k0..k3]
+    }
+    // Products on the FPU into DST, summed over the head's 4 tiles with fp32 SFPU adds in DST, so only one
+    // tile per quantity goes back through a CB (instead of 4), then one matmul with a ones column each.
+    cb_reserve_back(c_tmp, 3);
+    reconfig_data_format(c_qkfull, c_qkfull);
+    mul_init(c_qkfull, c_qkfull);
+    tile_regs_acquire();
+    for (uint32_t i = 0; i < KT; ++i) {
+        mul_tiles(c_qkfull, c_qkfull, i, i, i);                // q_i * q_i
+        mul_tiles(c_qkfull, c_qkfull, KT + i, KT + i, KT + i);  // k_i * k_i
+    }
+    add_binary_tile_init();
+    add_binary_tile(0, 1, 0);
+    add_binary_tile(2, 3, 2);
+    add_binary_tile(0, 2, 0);
+    add_binary_tile(4, 5, 4);
+    add_binary_tile(6, 7, 6);
+    add_binary_tile(4, 6, 4);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, c_tmp);
+    pack_tile(4, c_tmp);
+    tile_regs_release();
+    mul_init(c_qkfull, c_qkfull);
+    tile_regs_acquire();
+    for (uint32_t i = 0; i < KT; ++i) {
+        mul_tiles(c_qkfull, c_qkfull, i, KT + i, i);  // q_i * k_i
+    }
+    add_binary_tile_init();
+    add_binary_tile(0, 1, 0);
+    add_binary_tile(2, 3, 2);
+    add_binary_tile(0, 2, 0);
+    pack_one(c_tmp);
+    cb_push_back(c_tmp, 3);
+    cb_wait_front(c_tmp, 3);
+    cb_reserve_back(c_scal, 5);
+    mm_init(c_tmp, c_gconst);  // row sums -> column 0: |q|^2, |k|^2, q.k
+    for (uint32_t g = 0; g < 3; ++g) {
+        tile_regs_acquire();
+        matmul_tiles(c_tmp, c_gconst, g, G_ONES_COL, 0);
+        pack_one(c_scal);
+    }
+    cb_pop_front(c_tmp, 3);
+    // a, b of this core's head -> column 0 (same in1 and format as above: no re-init)
     tile_regs_acquire();
     matmul_tiles(c_p, c_gconst, 4, G_SEL_A, 0);
     pack_one(c_scal);
@@ -175,7 +215,9 @@ void kernel_main() {
     pack_one(c_scal);
     cb_push_back(c_scal, 5);
 
+    }
     // ---- C3: per-row scalars (fp32 SFPU) -----------------------------------------------------------
+    { DeviceZoneScopedN("GATING");
     cb_wait_front(c_scal, 5);
     cb_reserve_back(c_scal2, 5);
     copy_init(c_scal);
@@ -222,7 +264,9 @@ void kernel_main() {
     cb_push_back(c_scal2, 5);
     cb_pop_front(c_scal, 5);
 
+    }
     // ---- C4: row-scaled recurrence inputs ------------------------------------------------------------
+    { DeviceZoneScopedN("PREP");
     cb_wait_front(c_scal2, 5);
     cb_reserve_back(c_prep, 3 * KT + 2);
     reconfig_data_format(c_qkfull, c_scal2);
@@ -246,8 +290,24 @@ void kernel_main() {
     cb_pop_front(c_scal2, 5);
     cb_pop_front(c_qkfull, 2 * KT);
 
-    // ---- C5: recurrence (row b = sequence b, its own state slot) -----------------------------------------
+    // (beta*k)^T once per step: column b = beta_b k_b. With u holding only row b, (beta*k)^T @ u is exactly
+    // sequence b's outer product, so no per-token column tile is needed.
+    cb_wait_front(c_prep, 3 * KT + 2);  // read only; the reader pops it
+    cb_reserve_back(c_kb, KT);
+    reconfig_data_format<SrcOrder::Reverse>(c_gconst, c_prep);
+    matmul_init(c_gconst, c_prep, 1);  // transpose in1: I @ KB^T
+    for (uint32_t i = 0; i < KT; ++i) {
+        tile_regs_acquire();
+        matmul_tiles(c_gconst, c_prep, G_ID, 2 * KT + i, 0);
+        pack_one(c_kb);
+    }
+    cb_push_back(c_kb, KT);
+
+    }
+    // ---- C5: recurrence (row b = sequence b, its own state slot; every per-token tile keeps row b) ------
+    { DeviceZoneScopedN("RECURRENCE");
     mm_init(c_nkd, c_state);
+    cb_wait_front(c_kb, KT);
     for (uint32_t r = 0; r < B; ++r) {
         if (r > 0) {
             cb_wait_front(c_sync, 1);
@@ -283,7 +343,6 @@ void kernel_main() {
         cb_pop_front(c_w, 1);
 
         cb_wait_front(c_d, 1);
-        cb_wait_front(c_kb, KT);
         pack_reconfig_l1_acc(1);
         for (uint32_t i = 0; i < KT; ++i) {
             tile_regs_acquire();
@@ -296,15 +355,19 @@ void kernel_main() {
         }
         pack_reconfig_l1_acc(0);
         cb_pop_front(c_d, 1);
-        cb_pop_front(c_kb, KT);
         cb_pop_front(c_u, 1);
         cb_reserve_back(c_sync, 1);
         cb_push_back(c_sync, 1);
     }
     cb_wait_front(c_sync, 1);
     cb_pop_front(c_sync, 1);
+    cb_pop_front(c_kb, KT);
 
+    }
     // ---- C6: gated RMSNorm --------------------------------------------------------------------------
+    { DeviceZoneScopedN("RMSNORM");
+    // y = o * rstd * silu(z); the norm weight lives in the out_proj rows. o * silu(z) is computed while
+    // the head's 4 partial sums of squares are being exchanged; rstd is applied last.
     cb_wait_front(c_oblk, 1);
     cb_reserve_back(c_tmp2, 1);
     reconfig_data_format(c_oblk, c_oblk);
@@ -321,6 +384,21 @@ void kernel_main() {
     pack_one(c_ss);  // to the head's 4 cores
     cb_push_back(c_ss, 1);
     cb_pop_front(c_tmp2, 1);
+
+    cb_reserve_back(c_tmp2, 1);
+    tile_regs_acquire();
+    copy_init(c_p);
+    copy_tile(c_p, 3, 0);  // z
+    copy_init(c_oblk);
+    copy_tile(c_oblk, 0, 1);  // o
+    silu_tile_init();
+    silu_tile(0);
+    mul_binary_tile_init();
+    mul_binary_tile(0, 1, 0);  // o * silu(z), fp32
+    pack_one(c_tmp2);
+    cb_push_back(c_tmp2, 1);
+    cb_pop_front(c_p, P_TILES);
+    cb_pop_front(c_oblk, 1);
 
     cb_wait_front(c_ssp, GROUP);
     cb_reserve_back(c_tmp3, 1);  // rstd
@@ -342,48 +420,19 @@ void kernel_main() {
     cb_push_back(c_tmp3, 1);
     cb_pop_front(c_ssp, GROUP);
 
-    cb_wait_front(c_tmp3, 1);
-    cb_reserve_back(c_tmp2, 1);
-    reconfig_data_format(c_oblk, c_tmp3);
-    mul_bcast_cols_init(c_oblk, c_tmp3);
-    tile_regs_acquire();
-    mul_tiles_bcast_cols(c_oblk, c_tmp3, 0, 0, 0);
-    pack_one(c_tmp2);  // o * rstd
-    cb_push_back(c_tmp2, 1);
-    cb_pop_front(c_tmp3, 1);
-    cb_pop_front(c_oblk, 1);
-
-    cb_wait_front(c_tmp2, 1);
-    cb_reserve_back(c_tmp3, 1);
-    mm_init(c_tmp2, c_lconst);
-    tile_regs_acquire();
-    matmul_tiles(c_tmp2, c_lconst, 0, L_NORM, 0);
-    pack_one(c_tmp3);  // * norm weight
-    cb_push_back(c_tmp3, 1);
-    cb_pop_front(c_tmp2, 1);
-
-    cb_reserve_back(c_tmp2, 1);
-    copy_init(c_p);
-    tile_regs_acquire();
-    copy_tile(c_p, 3, 0);
-    silu_tile_init();
-    silu_tile(0);
-    pack_one(c_tmp2);  // silu(z)
-    cb_push_back(c_tmp2, 1);
-    cb_pop_front(c_p, P_TILES);
-
     cb_wait_front(c_tmp2, 1);
     cb_wait_front(c_tmp3, 1);
     cb_reserve_back(c_tmp2, 1);  // capacity 2: y goes in the second slot
-    reconfig_data_format(c_tmp3, c_tmp2);
-    mul_init(c_tmp3, c_tmp2);
+    reconfig_data_format(c_tmp2, c_tmp3);
+    mul_bcast_cols_init(c_tmp2, c_tmp3);
     tile_regs_acquire();
-    mul_tiles(c_tmp3, c_tmp2, 0, 0, 0);
+    mul_tiles_bcast_cols(c_tmp2, c_tmp3, 0, 0, 0);
     pack_one(c_tmp2);
     cb_push_back(c_tmp2, 1);
-    cb_pop_front(c_tmp2, 1);  // silu(z)
+    cb_pop_front(c_tmp2, 1);  // o * silu(z)
     cb_pop_front(c_tmp3, 1);
 
+    }
     // ---- C7: partial out_proj -----------------------------------------------------------------------
     {
     DeviceZoneScopedN("OUT_PROJ");
@@ -426,16 +475,16 @@ void kernel_main() {
 
     // ---- C8: owners reduce the 64 partials of their output tile ------------------------------------
     if (is_owner) {
-        cb_wait_front(c_recv, 2 * B);  // row r: tiles 2r (cores 0..31), 2r+1 (cores 32..63), one core per row
+        DeviceZoneScopedN("REDUCE");
+        cb_wait_front(c_recv, 2 * BP);  // 32 / BP senders per tile, BP rows each
         mm_init(c_gconst, c_recv);
-        for (uint32_t r = 0; r < B; ++r) {
-            cb_reserve_back(c_ss, 1);
-            tile_regs_acquire();
-            matmul_tiles(c_gconst, c_recv, G_ONES_ROW, 2 * r, 0);
-            matmul_tiles(c_gconst, c_recv, G_ONES_ROW, 2 * r + 1, 0);
-            pack_one(c_ss);  // row 0 = sum over the 64 cores
-            cb_push_back(c_ss, 1);
+        cb_reserve_back(c_ss, 1);
+        tile_regs_acquire();
+        for (uint32_t t = 0; t < 2 * BP; ++t) {
+            matmul_tiles(c_gconst, c_recv, G_SEL_RED, t, 0);
         }
-        cb_pop_front(c_recv, 2 * B);
+        pack_one(c_ss);  // rows 0..BP-1 = sums over the 64 cores
+        cb_push_back(c_ss, 1);
+        cb_pop_front(c_recv, 2 * BP);
     }
 }

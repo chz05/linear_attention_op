@@ -23,7 +23,7 @@ from gdn_l1 import Qwen35_08B_GDNStackL1
 from test_gdn_l1 import make_hf_layers
 
 SECONDS = 5.0
-CONFIGS = [("bfp8", ttnn.bfloat8_b, 3, 1), ("bf16", ttnn.bfloat16, 2, 1), ("bfp8", ttnn.bfloat8_b, 3, 4)]
+CONFIGS = [("bfp8", ttnn.bfloat8_b, 3, 1), ("bf16", ttnn.bfloat16, 2, 1), ("bfp8", ttnn.bfloat8_b, 3, 4), ("bfp8", ttnn.bfloat8_b, 2, 8)]
 
 
 def card_power_file():
@@ -68,7 +68,7 @@ def measure(dev, power_file, name, dtype, n_layers, batch, dram):
         dev, make_hf_layers(n_layers, seed=7), batch=batch, weight_dtype=dtype, weights_in_dram=dram
     )
     x0 = ttnn.from_torch(
-        torch.randn(32, 1024), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=dev,
+        torch.randn(16, 1024), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=dev,
         memory_config=ttnn.L1_MEMORY_CONFIG,
     )
     outs = stack.allocate_activations()

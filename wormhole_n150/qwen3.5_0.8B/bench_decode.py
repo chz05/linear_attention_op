@@ -16,7 +16,7 @@ from test_gdn_l1 import make_hf_layers
 
 STEPS = 500
 DTYPES = {"bfp8": ttnn.bfloat8_b, "bf16": ttnn.bfloat16}
-CONFIGS = [("bfp8", 3, 1), ("bf16", 2, 1), ("bfp8", 3, 4)]
+CONFIGS = [("bfp8", 3, 1), ("bf16", 2, 1), ("bfp8", 3, 4), ("bfp8", 2, 8)]
 
 
 def run(dev, name, n_layers, batch, dram, profile=False):
@@ -24,7 +24,7 @@ def run(dev, name, n_layers, batch, dram, profile=False):
         dev, make_hf_layers(n_layers, seed=7), batch=batch, weight_dtype=DTYPES[name], weights_in_dram=dram
     )
     x0 = ttnn.from_torch(
-        torch.randn(32, 1024), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=dev, memory_config=ttnn.L1_MEMORY_CONFIG
+        torch.randn(16, 1024), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=dev, memory_config=ttnn.L1_MEMORY_CONFIG
     )
     for _ in range(10):  # warm-up: compile + program cache
         ttnn.deallocate(stack.forward_device(x0, keep_input=True))

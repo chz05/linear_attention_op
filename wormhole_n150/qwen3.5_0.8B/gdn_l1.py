@@ -32,8 +32,8 @@ KERNEL_DIR = Path(__file__).resolve().parent / "kernels"
 
 N_CORES, GROUP, N_OUT = 64, 4, 32
 KT, KX, P_TILES, CONV_TILES, X_CHUNK = 4, 32, 5, 3, 4
-N_LCONST, N_GCONST = 13, 5
-MAX_BATCH = 32
+N_LCONST, N_GCONST = 12, 5
+MAX_BATCH = 16  # BP = batch rounded up to a power of 2 must divide 32 senders' slots
 
 (C_QD, C_NKD, C_KB, C_V, C_D, C_W, C_RECV, C_U, C_STATE, C_SYNC, C_X, C_WIN, C_WOUT, C_LCONST, C_GCONST, C_P,
  C_XS, C_QKLOC, C_QKFULL, C_CV, C_TMP, C_SCAL, C_SCAL2, C_PREP, C_OUT, C_OBLK, C_SS, C_SSP, _FREE, C_TMP2,
@@ -43,9 +43,29 @@ MAX_BATCH = 32
 # row per sequence if larger: it also receives the multicast input rows at the start of a launch).
 WORK_CBS = {
     C_QD: KT, C_NKD: KT, C_KB: KT, C_V: 1, C_D: 1, C_W: 1, C_U: 1, C_X: 2 * X_CHUNK, C_P: P_TILES,
-    C_XS: 3 * CONV_TILES, C_QKLOC: 2, C_QKFULL: 2 * KT, C_CV: 1, C_TMP: KT, C_SCAL: 5, C_SCAL2: 5,
+    C_XS: 3 * CONV_TILES, C_QKLOC: 2, C_QKFULL: 2 * KT, C_CV: 1, C_TMP: 3, C_SCAL: 5, C_SCAL2: 5,
     C_OUT: 2, C_OBLK: 1, C_SS: 2, C_SSP: GROUP, C_TMP2: 2, C_TMP3: 1,
 }
+
+
+def padded_batch(batch):
+    """Batch rounded up to a power of 2: the row count of every activation block and reduce slot."""
+    return 1 << (batch - 1).bit_length()
+
+
+def to_face_major(x, bp):
+    """[B, 1024] -> [32, 1024] fp32 buffer whose memory is the kernels' face-major activation layout:
+    value (row r, column 32k + 16h + e) at word ((2k + h) * bp + r) * 16 + e."""
+    rows = torch.zeros(bp, x.shape[1])
+    rows[: x.shape[0]] = x.float()
+    flat = torch.zeros(MAX_BATCH * x.shape[1])
+    flat[: bp * x.shape[1]] = rows.reshape(bp, -1, 2, 16).permute(1, 2, 0, 3).reshape(-1)
+    return flat.reshape(-1, x.shape[1])
+
+
+def from_face_major(buf, batch, bp, hidden):
+    flat = buf.reshape(-1)[: bp * hidden]
+    return flat.reshape(hidden // 32, 2, bp, 16).permute(2, 0, 1, 3).reshape(bp, hidden)[:batch]
 
 
 def f32_bits(x):
@@ -62,7 +82,8 @@ def tile_bytes(dtype):
 
 def l1_bytes_per_core(batch, num_layers, weight_dtype):
     """Static L1 estimate per core (working CBs + global constants + per-layer weights and states)."""
-    work = (sum(WORK_CBS.values()) + 2 * batch + max(3 * KT + 2, batch)) * F32_TILE + 64
+    bp = padded_batch(batch)
+    work = (sum(WORK_CBS.values()) + 2 * bp + max(3 * KT + 2, bp)) * F32_TILE + 64
     per_layer = (KX * P_TILES + N_OUT) * tile_bytes(weight_dtype) + N_LCONST * 2048 + batch * (KT + 1) * F32_TILE
     return work + N_GCONST * F32_TILE + num_layers * per_layer
 
@@ -84,10 +105,10 @@ class _Layer:
             ch = torch.arange(h * dk + s * TILE, h * dk + (s + 1) * TILE)
             q, k, v = ch, kd + ch, 2 * kd + ch
             win.append(torch.cat([w_qkv[q], w_qkv[k], w_qkv[v], w_z[ch], w_ab]))  # [160, 1024]
-            wout.append(w_o[:, ch].T)  # [32, 1024]
+            # RMSNorm weight folded into this core's rows: y_c * w_c * W_o[:, c] = y_c * (w_c * W_o[:, c])
+            wout.append(w_o[:, ch].T * L.norm.weight.float()[s * TILE:(s + 1) * TILE, None])  # [32, 1024]
             conv_ch = torch.cat([q, k, v])
             tiles = [torch.diag(conv_w[conv_ch[ct * TILE:(ct + 1) * TILE], 3 - sh]) for sh in range(4) for ct in range(3)]
-            tiles.append(torch.diag(L.norm.weight.float()[s * TILE:(s + 1) * TILE]))
             lconst.append(torch.cat(tiles))
         dram = stack.weights_in_dram
         self.w_in = ttnn.from_torch(
@@ -140,6 +161,7 @@ class Qwen35_08B_GDNStackL1:
         assert (self.hidden, L0.num_k_heads, self.nh, self.dk, L0.head_v_dim) == (1024, 16, 16, 128, 128), \
             "Qwen3.5-0.8B GDN geometry"
         assert batch <= MAX_BATCH
+        self.bp = padded_batch(batch)
         grid = device.compute_with_storage_grid_size()
         assert (grid.x, grid.y) == (8, 8)
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(7, 7))])
@@ -153,13 +175,14 @@ class Qwen35_08B_GDNStackL1:
         for c in range(N_CORES):
             h, _ = core_head(c)
             ident = torch.eye(TILE)
-            ones_col, ones_row = torch.zeros(TILE, TILE), torch.zeros(TILE, TILE)
+            ones_col, sel_red = torch.zeros(TILE, TILE), torch.zeros(TILE, TILE)
             ones_col[:, 0] = 1.0
-            ones_row[0, :] = 1.0
+            for j in range(TILE):  # owner's reduce: row r <- sum of rows j with j % bp == r
+                sel_red[j % self.bp, j] = 1.0
             sel_a, sel_b = torch.zeros(TILE, TILE), torch.zeros(TILE, TILE)
             sel_a[h, 0] = 1.0
             sel_b[self.nh + h, 0] = 1.0
-            g.append(torch.cat([ident, ones_col, ones_row, sel_a, sel_b]))
+            g.append(torch.cat([ident, ones_col, sel_red, sel_a, sel_b]))
         self.gconst = ttnn.from_torch(
             torch.cat(g), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device,
             memory_config=self.height_sharded((N_GCONST * TILE, TILE)),
@@ -196,7 +219,7 @@ class Qwen35_08B_GDNStackL1:
             )
 
         cbs = [cb(i, n) for i, n in WORK_CBS.items()]
-        cbs += [cb(C_RECV, 2 * self.batch), cb(C_PREP, max(3 * KT + 2, self.batch)), cb(C_SYNC, 2, page=32)]
+        cbs += [cb(C_RECV, 2 * self.bp), cb(C_PREP, max(3 * KT + 2, self.bp)), cb(C_SYNC, 2, page=32)]
         cbs += [
             ttnn.cb_descriptor_from_sharded_tensor(C_STATE, layer.rec_state),
             ttnn.cb_descriptor_from_sharded_tensor(C_CONV, layer.conv_state),
@@ -219,12 +242,12 @@ class Qwen35_08B_GDNStackL1:
 
     def _kernels(self, li, x, out):
         layer, B = self.layers[li], self.batch
-        reader_ct = [B, 3]
+        reader_ct = [B, 3, self.bp]
         if self.weights_in_dram:
             reader_ct += [tile_bytes(self.weight_dtype)]
             for t in (layer.w_in, layer.w_out, layer.lconst):
                 reader_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
-        writer_ct = [0, 1, 2, 3] + ttnn.TensorAccessorArgs(out).get_compile_time_args()
+        writer_ct = [0, 1, 2, 3, self.bp] + ttnn.TensorAccessorArgs(out).get_compile_time_args()
         writer_ct += ttnn.TensorAccessorArgs(x).get_compile_time_args()
         mcast = [self.noc_xy[0].x, self.noc_xy[0].y, self.noc_xy[-1].x, self.noc_xy[-1].y]
         reader_rt, writer_rt, compute_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -258,7 +281,7 @@ class Qwen35_08B_GDNStackL1:
         return [
             kernel("reader", reader_ct, reader_rt, ttnn.ReaderConfigDescriptor()),
             kernel("writer", writer_ct, writer_rt, ttnn.WriterConfigDescriptor()),
-            kernel("compute", [B], compute_rt, compute_cfg),
+            kernel("compute", [B, self.bp], compute_rt, compute_cfg),
         ]
 
     def _program(self, li, x, out):
@@ -270,7 +293,8 @@ class Qwen35_08B_GDNStackL1:
 
     # ---- forward (decode) ------------------------------------------------------------------------
     def forward_device(self, x, layers=None, keep_input=False):
-        """x: [32, 1024] fp32 row-major L1 tensor, row b = this step's token of sequence b. Runs the layers in order."""
+        """x: [32, 1024] fp32 L1 tensor holding this step's input in the face-major layout (see to_face_major).
+        Runs the layers in order; the output uses the same layout."""
         for n, li in enumerate(range(len(self.layers)) if layers is None else layers):
             out = ttnn.allocate_tensor_on_device(
                 ttnn.Shape([MAX_BATCH, self.hidden]), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, self.device,
@@ -309,11 +333,9 @@ class Qwen35_08B_GDNStackL1:
         x = hidden_states.reshape(-1, shape[-1])
         B, H = x.shape
         assert B == self.batch and H == self.hidden, "one token per sequence per call"
-        rows = torch.zeros(MAX_BATCH, H)
-        rows[:B] = x.float()
-        xd = ttnn.from_torch(rows, dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device,
-                             memory_config=ttnn.L1_MEMORY_CONFIG)
+        xd = ttnn.from_torch(to_face_major(x, self.bp), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                             device=self.device, memory_config=ttnn.L1_MEMORY_CONFIG)
         y = self.forward_device(xd, layers)
-        out = ttnn.to_torch(y)[:B].reshape(shape)
+        out = from_face_major(ttnn.to_torch(y), B, self.bp, H).reshape(shape)
         ttnn.deallocate(y)
         return out

@@ -39,11 +39,15 @@ def make_hf_layers(n, seed=0, weight_dtype=ttnn.bfloat16, device=None):
         with torch.no_grad():
             L.norm.weight.uniform_(0.5, 1.5)
             L.dt_bias.uniform_(-1.0, 1.0)
-            for p in (L.in_proj_qkv, L.in_proj_z, L.in_proj_a, L.in_proj_b, L.out_proj):
+            L.norm.weight.copy_(L.norm.weight.bfloat16().float())
+            for p in (L.in_proj_qkv, L.in_proj_z, L.in_proj_a, L.in_proj_b):
                 # the device stores W^T sliced by core; quantisation blocks run along rows of W^T
                 p.weight.copy_(quantize(p.weight.T.contiguous(), weight_dtype, device).T)
+            # out_proj: the device quantises W_o^T with the RMSNorm weight folded into its rows
+            nw = L.norm.weight.repeat(L.out_proj.weight.shape[1] // L.norm.weight.numel())[:, None]
+            folded = quantize((L.out_proj.weight.T * nw).contiguous(), weight_dtype, device)
+            L.out_proj.weight.copy_((folded / nw).T)
             L.conv1d.weight.copy_(L.conv1d.weight.bfloat16().float())
-            L.norm.weight.copy_(L.norm.weight.bfloat16().float())
         layers.append(L)
     return layers
 
@@ -75,7 +79,7 @@ def run_decode(device, n_layers, B, weight_dtype, steps=8, seed=1, weights_in_dr
     return [torch.stack(g, dim=1) for g in got], want
 
 
-@pytest.mark.parametrize("B", [1, 4, 8])
+@pytest.mark.parametrize("B", [1, 3, 4, 8, 16])
 def test_decode_one_layer_bf16(device, B):
     got, want = run_decode(device, 1, B, ttnn.bfloat16)
     check(f"decode 1 layer bf16 B={B}", got[0], want[0])

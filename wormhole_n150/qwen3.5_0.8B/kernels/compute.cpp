@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Qwen3.5-0.8B Gated DeltaNet layer, all weights in L1 -- compute. Decode only: one launch = one token
-// for each of the B sequences (row b = sequence b, B <= 16):
+// for each of the B sequences (row b = sequence b, B <= 16; B is a runtime argument, so a shrinking batch reuses
+// the program of its BP; rows B..BP-1 are zero padding):
 //   C0  in_proj from this core's resident weight slice -> P = [q/4 | k/4 | v/4 | z/4 | a,b of all heads]
 //       (the input is read in place as BP x 32 tiles)
 //   C1  causal conv1d + SiLU on q/4, k/4, v/4 (x_s @ diag(w_tap), x_s read in place from the conv state),
@@ -87,8 +88,9 @@ inline void copy_init(uint32_t cb) {
 
 // ---- SFPU work on the batch rows only ---------------------------------------------------------------------
 // In a face, SFPU row i (dst_reg[i]) holds DST rows 4(i/2)..4(i/2)+3 at the even (i even) or odd (i odd)
-// columns; an fp32 tile is 32 SFPU rows (faces 0..3, 8 each). With G = ceil(B/4) groups of 4 rows, rows 0..B-1
-// of a tile are SFPU rows 0..2G-1 of faces 0 and 1, and their column 0 is SFPU rows 0, 2, .., 2G-2 of face 0.
+// columns; an fp32 tile is 32 SFPU rows (faces 0..3, 8 each). With G = ceil(BP/4) groups of 4 rows, rows 0..BP-1
+// of a tile are SFPU rows 0..2G-1 of faces 0 and 1, and their column 0 is SFPU rows 0, 2, .., 2G-2 of face 0
+// (the zero padding rows B..BP-1 are computed too and stay finite).
 // The SFPU functions below run once on the tile at the DST base (VectorMode::None) and touch only those rows.
 #ifdef TRISC_MATH
 namespace ckernel::sfpu {
@@ -236,9 +238,8 @@ inline void gating_rows(
 #define SFPU_ROWS_INIT() MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::unused>()))
 
 void kernel_main() {
-    constexpr uint32_t B = get_compile_time_arg_val(0);
-    constexpr uint32_t BP = get_compile_time_arg_val(1);
-    constexpr int G = (B + 3) / 4;  // groups of 4 batch rows (SFPU work)
+    constexpr uint32_t BP = get_compile_time_arg_val(0);
+    constexpr int G = (BP + 3) / 4;  // groups of 4 batch rows (SFPU work)
     constexpr uint32_t PFULL = BP * GROUP / 32 > 1 ? BP * GROUP / 32 : 1;  // tiles of the head's 4 partial sums
     const uint32_t dt_bias = get_arg_val<uint32_t>(0);
     const uint32_t neg_A = get_arg_val<uint32_t>(1);
@@ -248,6 +249,7 @@ void kernel_main() {
     const uint32_t inv_dv = get_arg_val<uint32_t>(5);
     const uint32_t norm_eps = get_arg_val<uint32_t>(6);
     const uint32_t core = get_arg_val<uint32_t>(7);
+    const uint32_t B = get_arg_val<uint32_t>(8);  // sequences in the batch, 1..BP
 
     compute_kernel_hw_startup<SrcOrder::Reverse>(c_x, c_win, c_p);
 

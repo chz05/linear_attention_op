@@ -55,23 +55,24 @@ FORCE_INLINE void dma_zero_row(uint64_t zeros, uint32_t dst, uint32_t dr) {
 }
 
 void kernel_main() {
-    constexpr uint32_t B = get_compile_time_arg_val(0);
+    constexpr uint32_t BP = get_compile_time_arg_val(0);  // batch rounded up to a power of 2 (<= 16)
     const uint32_t sem_x = get_semaphore(get_compile_time_arg_val(1));
-    constexpr uint32_t BP = get_compile_time_arg_val(2);  // batch rounded up to a power of 2 (<= 16)
-    const uint32_t sem_ready = get_semaphore(get_compile_time_arg_val(3));
+    const uint32_t sem_ready = get_semaphore(get_compile_time_arg_val(2));
     constexpr uint32_t BLOCK = BP * 64;                     // BP rows of one face
     const uint32_t conv_base = get_write_ptr(c_conv);
-    // args 0: core; 1..4: this half of the grid (first core, last core; the first is its y gather coordinator)
+    // args 0: core; 1: batch (1..BP); 2..5: this half of the grid (first core, last core; the first is its y gather
+    // coordinator)
     const uint32_t core = get_arg_val<uint32_t>(0);
+    const uint32_t B = get_arg_val<uint32_t>(1);
 #ifdef WEIGHTS_IN_DRAM
     // Comparison mode: the same per-core weight slices, but stored in DRAM and streamed every step.
-    constexpr uint32_t W_TILE_BYTES = get_compile_time_arg_val(5);
-    constexpr auto win_args = TensorAccessorArgs<6>();
+    constexpr uint32_t W_TILE_BYTES = get_compile_time_arg_val(3);
+    constexpr auto win_args = TensorAccessorArgs<4>();
     constexpr auto wout_args = TensorAccessorArgs<win_args.next_compile_time_args_offset()>();
     constexpr auto lc_args = TensorAccessorArgs<wout_args.next_compile_time_args_offset()>();
-    const auto win_acc = TensorAccessor(win_args, get_arg_val<uint32_t>(5));
-    const auto wout_acc = TensorAccessor(wout_args, get_arg_val<uint32_t>(6));
-    const auto lc_acc = TensorAccessor(lc_args, get_arg_val<uint32_t>(7));
+    const auto win_acc = TensorAccessor(win_args, get_arg_val<uint32_t>(6));
+    const auto wout_acc = TensorAccessor(wout_args, get_arg_val<uint32_t>(7));
+    const auto lc_acc = TensorAccessor(lc_args, get_arg_val<uint32_t>(8));
 #endif
 
     // 1. layer input: BP rows of 1024 fp32 (one per sequence), multicast by core 0 into the memory c_x shares with
@@ -141,7 +142,7 @@ void kernel_main() {
     }
     // in_proj is done (c_p exists), so the input in c_prep's memory is no longer read: tell this half's y gather
     // coordinator, which multicasts the gathered y there (c_yg) once the whole half is ready
-    noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(1), get_arg_val<uint32_t>(2), sem_ready), 1);
+    noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(2), get_arg_val<uint32_t>(3), sem_ready), 1);
 
     // buffers that are only written in row r / col 0 / diagonal later on
     {

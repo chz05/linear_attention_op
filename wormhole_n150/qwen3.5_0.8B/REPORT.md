@@ -131,7 +131,7 @@ The baseline is the previous version of this kernel (round 2 in [OPTIMIZATION.md
 | bfp8, **4 layers**, batch 1 / 2 | did not fit → **33 / 36** (130 / 143) | | |
 
 - **Accuracy** against Hugging Face with the same weights: 0.36–0.39% error, PCC ≥ 0.999998, for batch 1–16
-  (was 0.38–0.41%); all 11 tests in `test_gdn_l1.py` pass.
+  (was 0.38–0.41%); all 15 tests in `test_gdn_l1.py` pass.
 - **L1 capacity** (bfp8): 4 layers at batch 1 and 2 (was 3), 3 at batch 4, 2 at batch 8, 1 at batch 16.
 
 ## 5. Energy
@@ -155,3 +155,19 @@ open is 19.8 W. Energy per token per GDN layer:
 L1 now uses 40–70% less energy per token than streaming them from DRAM (23–52% before). About 20 W of the board power
 is idle power, so batching is still the biggest energy lever: at batch 8 a layer costs 0.45 mJ per token, 3.5× less
 than at batch 1.
+
+## 6. Shrinking batch
+
+Sequences finish at random steps, so the batch can drop from 16 to any size down to 0. The kernels take the batch as
+a runtime argument (one program per padded batch: 1, 2, 4, 8, 16), and `retire(rows)` moves the remaining sequences'
+states up to rows 0..B'−1 on the device in 2–13 µs (~0.1 ms on the host), so every step runs at the speed of the
+current batch. *Files:* [`kernels/compact.cpp`](kernels/compact.cpp), [`gdn_l1.py`](gdn_l1.py) (`retire`,
+`_compact`), [`kernels/compute.cpp`](kernels/compute.cpp) and [`kernels/reader.cpp`](kernels/reader.cpp) (batch as a
+runtime argument), [`test_gdn_l1.py`](test_gdn_l1.py) (`test_decode_shrinking_batch*`), [`bench_shrink.py`](bench_shrink.py).
+
+| Batch | 16 | 13 | 10 | 8 | 5 | 4 | 3 | 2 | 1 |
+|---|---|---|---|---|---|---|---|---|---|
+| µs per layer (bfp8, profiler) | 97.1 | 89.1 | 81.3 | 60.1 | 52.1 | 42.4 | 39.8 | 35.2 | 32.1 |
+
+Every step of a shrinking batch (16 → 10 → 8 → 5 → 3 → 2 → 1 → 0, 16 → 15 → 0, and 16 random sequence lengths) matches Hugging Face
+within 0.44%.

@@ -23,16 +23,26 @@ stack = Qwen35_08B_GDNStackL1(device, hf_gdn_layers, batch=B, weight_dtype=ttnn.
 y = stack(x_t)               # one decode step: [B, 1024] -> [B, 1024], layers back to back
 y = stack(x_t, layers=[i])   # one layer; each layer keeps its own L1 conv + recurrent state
 stack.reset_state()          # new sequences
+
+# shrinking batch: sequences finish at any step, in any order, down to batch 0
+stack = Qwen35_08B_GDNStackL1(device, hf_gdn_layers, batch=16, weight_dtype=ttnn.bfloat8_b)
+y = stack(x_t)               # x_t: [stack.batch, 1024], row b = sequence stack.seq_ids[b]
+stack.retire([2, 7, 9])      # those rows finished: the others move up (on the device), batch 16 -> 13
 ```
+
+After `retire`, later steps run with the program of the smaller batch (one per power of 2), so the step gets
+faster as the batch shrinks; at batch 0 a call takes and returns an empty tensor. A captured trace has to be
+captured again after `retire` (see `bench_shrink.py`).
 
 For traced decode, `allocate_activations()` + `forward_into()` run a whole step into persistent buffers
 that `ttnn.begin_trace_capture` can record (see `bench_decode.py`).
 
 ```
 cd wormhole_n150/qwen3.5_0.8B
-python -m pytest -s test_gdn_l1.py     # vs Hugging Face, batch 1-16, L1 and DRAM weight modes
+python -m pytest -s test_gdn_l1.py     # vs Hugging Face, batch 1-16, shrinking batch, L1 and DRAM weights
 python bench_decode.py                 # 500 decode steps, weights in L1 vs DRAM
 python bench_energy.py                 # tokens/s, board power, energy per token
+python bench_shrink.py                 # 16 sequences finishing at random steps: batch 16 -> 0, traced
 python profile_layer.py                # device time per phase and per core (sets TT_METAL_DEVICE_PROFILER)
 ```
 
@@ -56,8 +66,11 @@ cores.
 | Layer time on chip (bfp8, profiler) | **32.0 us** (was 71.0) | 42.5 us (90.7) | 60.6 us (117.1) | 96.7 us (171.2) |
 | bfp8 layers that fit in L1 | 4 (was 3) | 3 | 2 | 1 |
 
-- **Accuracy**: 0.36-0.39% vs Hugging Face with the same weights (PCC 0.999998+); bfp8 weights add ~1%
-  vs the model's bf16 weights, bfp4 is too lossy (17.6%).
+- **Shrinking batch** (bfp8, profiler): 97.1 us at batch 16, 89.1 at 13, 81.3 at 10, 60.1 at 8, 52.1 at 5,
+  42.4 at 4, 39.8 at 3, 35.2 at 2, 32.1 at 1. Retiring sequences takes 2-13 us on the device (moving their
+  states) and ~0.1 ms on the host.
+- **Accuracy**: 0.36-0.39% vs Hugging Face with the same weights (PCC 0.999998+), also while the batch shrinks
+  16 -> 0; bfp8 weights add ~1% vs the model's bf16 weights, bfp4 is too lossy (17.6%).
 - **Traced decode** (500 steps): 33 us/layer for 3 bfp8 layers at batch 1 (99 us/step, was 74 us/layer),
   64 us/layer for 2 layers at batch 8 (was 122); 4 resident bfp8 layers: 130 us/step at batch 1.
 - **L1 vs DRAM weights**: 2.9x faster with bfp8 at batch 1 (33 vs 97 us/layer), 4.7x with bf16, 1.9x at

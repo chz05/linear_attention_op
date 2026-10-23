@@ -18,6 +18,7 @@ import glob
 import os
 import statistics
 import sys
+import time
 
 os.environ["TT_METAL_DEVICE_PROFILER"] = "1"
 
@@ -31,10 +32,13 @@ DTYPES = {"bfp8": ttnn.bfloat8_b, "bf16": ttnn.bfloat16, "bfp4": ttnn.bfloat4_b}
 LOG = os.path.join(os.environ.get("TT_METAL_HOME", os.path.expanduser("~/tt-metal")),
                    "generated", "profiler", ".logs", "profile_log_device.csv")
 READ_EVERY = 20  # launches between profiler reads (the device buffers hold a few hundred markers per RISC)
+# a define unique to this run, so the kernels compile here (not from the JIT cache) and log their zone locations
+NONCE = ("PROFILE_RUN", str(time.time_ns()))
 
 
 def run(dev, batch, dtype, launches, warmup=5):
     stack = Qwen35_08B_GDNStackL1(dev, make_hf_layers(1, seed=7), batch=batch, weight_dtype=DTYPES[dtype])
+    stack.defines = stack.defines + [NONCE]
     x0 = ttnn.from_torch(torch.randn(16, 1024), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=dev,
                          memory_config=ttnn.L1_MEMORY_CONFIG)
     for i in range(warmup + launches):
@@ -111,10 +115,13 @@ if __name__ == "__main__":
                     help="RISCs whose zones are listed (BRISC = writer, NCRISC = reader, TRISC_0/1/2 = "
                          "unpack/math/pack)")
     args = ap.parse_args()
+    # stale zone-location logs from earlier kernel versions can collide with the new zones' hashes; they are kept
+    # between configs, since batches with the same padded batch share kernels, compiled (and logged) once per run
+    for f in glob.glob(os.path.join(os.path.dirname(LOG), "*")):
+        os.remove(f)
     for b in args.batch:
-        # stale zone-location logs from earlier kernel versions can collide with the new zones' hashes
-        for f in glob.glob(os.path.join(os.path.dirname(LOG), "*")):
-            os.remove(f)
+        if os.path.exists(LOG):
+            os.remove(LOG)
         dev = ttnn.open_device(device_id=0)  # one session per config: the CSV is written when the device closes
         try:
             run(dev, b, args.dtype, args.launches)

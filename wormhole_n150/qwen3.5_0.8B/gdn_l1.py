@@ -18,6 +18,11 @@ heads splits the weights with them, and every slice stays in that core's L1 for 
 Decode only: one call = one token for each of the `batch` sequences (row b = sequence b). Layers run
 back to back, one launch each; activations go through a small L1-interleaved tensor, so nothing
 touches DRAM during a decode step.
+
+Shrinking batch: the states are allocated for the batch the stack is built with (up to 16). When sequences
+finish, retire(rows) moves the others' states up, in order, to rows 0..B'-1 on the device (kernels/compact.cpp)
+and later steps run the program of B' (one per power of 2: the kernels take the batch as a runtime argument),
+down to B' = 0. seq_ids says which original sequence each row holds.
 """
 
 import math
@@ -147,18 +152,20 @@ class _Layer:
         self.reset_state(stack)
 
     def reset_state(self, stack):
+        """Zeroed states for stack.max_batch sequences. A smaller batch uses the start of the same buffers: slots
+        0..B-1 of the recurrent state, and the conv state laid out as bp x 32 tiles of the current bp."""
         for t in (self.rec_state, self.conv_state):
             if t is not None:
                 ttnn.deallocate(t)
-        B, dev = stack.batch, stack.device
+        B, bp, dev = stack.max_batch, padded_batch(stack.max_batch), stack.device
         self.rec_state = ttnn.from_torch(
             torch.zeros(N_CORES * B * stack.dk, TILE), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev,
             memory_config=stack.height_sharded((B * stack.dk, TILE)),
         )
-        rows = conv_state_tiles() * stack.bp
+        rows = conv_state_tiles() * bp
         self.conv_state = ttnn.from_torch(
             torch.zeros(N_CORES * rows, TILE), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
-            tile=ttnn.Tile((stack.bp, TILE)), device=dev, memory_config=stack.height_sharded((rows, TILE)),
+            tile=ttnn.Tile((bp, TILE)), device=dev, memory_config=stack.height_sharded((rows, TILE)),
         )
 
 
@@ -170,7 +177,8 @@ class Qwen35_08B_GDNStackL1:
 
     def __init__(self, device, hf_layers, batch=1, weight_dtype=ttnn.bfloat8_b, weights_in_dram=False,
                  math_fidelity=ttnn.MathFidelity.HiFi4, mm_block=True, in_proj_fidelity=ttnn.MathFidelity.HiFi3):
-        self.device, self.batch = device, batch
+        self.device, self.batch, self.max_batch = device, batch, batch
+        self.seq_ids = list(range(batch))  # the original sequence in each row of the batch
         self.weight_dtype, self.weights_in_dram = weight_dtype, weights_in_dram
         self.math_fidelity = math_fidelity
         self.defines = ([("WEIGHTS_IN_DRAM", "1")] if weights_in_dram else []) + ([("MM_BLOCK", "1")] if mm_block else [])
@@ -180,19 +188,25 @@ class Qwen35_08B_GDNStackL1:
         self.hidden, self.nh, self.dk = L0.hidden_size, L0.num_v_heads, L0.head_k_dim
         assert (self.hidden, L0.num_k_heads, self.nh, self.dk, L0.head_v_dim) == (1024, 16, 16, 128, 128), \
             "Qwen3.5-0.8B GDN geometry"
-        assert batch <= MAX_BATCH
+        assert 1 <= batch <= MAX_BATCH
         self.bp = padded_batch(batch)
         grid = device.compute_with_storage_grid_size()
         assert (grid.x, grid.y) == (8, 8)
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(7, 7))])
         self.core_list = ttnn.corerange_to_cores(self.cores, row_wise=True)
         self.noc_xy = [device.worker_core_from_logical_core(c) for c in self.core_list]
-        self.kernels = {k: (KERNEL_DIR / f"{k}.cpp").read_text() for k in ("reader", "compute", "writer")}
+        self.kernels = {k: (KERNEL_DIR / f"{k}.cpp").read_text() for k in ("reader", "compute", "writer", "compact")}
         self._kernel_cache = {}
         # 0 q/k swap, 1 norm exchange, 2 out_proj pair exchange, 3 input multicast, y gather: 4 c_prep free and
         # 5 y delivered (counted on the coordinator), 6 gathered y landed; 7 l2-norm partials
         self._semaphores = [ttnn.SemaphoreDescriptor(i, ttnn.CoreType.WORKER, self.cores, 0) for i in range(8)]
+        self.gconst = self._make_gconst()
+        with torch.no_grad():
+            self.layers = [_Layer(self, L, weight_dtype) for L in hf_layers]
 
+    def _make_gconst(self):
+        """Global constants per core: identity, ones in column 0 / 1 / 16, this head's a and b selectors, and the
+        group-sum selector of the current bp (compact.cpp rewrites it when the batch shrinks)."""
         g = []
         for c in range(N_CORES):
             h, _ = core_head(c)
@@ -207,12 +221,10 @@ class Qwen35_08B_GDNStackL1:
             for j in range(TILE):  # the head's 4 partials: row r <- every row j with j % bp == r
                 sel_grp[j % self.bp, j] = 1.0
             g.append(torch.cat([ident, *ones, sel_a, sel_b, sel_grp]))
-        self.gconst = ttnn.from_torch(
-            torch.cat(g), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device,
+        return ttnn.from_torch(
+            torch.cat(g), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device,
             memory_config=self.height_sharded((N_GCONST * TILE, TILE)),
         )
-        with torch.no_grad():
-            self.layers = [_Layer(self, L, weight_dtype) for L in hf_layers]
 
     # ---- memory configs -------------------------------------------------------------------------
     def _sharded(self, layout, shape):
@@ -225,13 +237,53 @@ class Qwen35_08B_GDNStackL1:
         return self._sharded(ttnn.TensorMemoryLayout.WIDTH_SHARDED, shape)
 
     def reset_state(self):
+        """Zero every state and start over with the full batch (new sequences in rows 0..max_batch-1)."""
         for layer in self.layers:
             layer.reset_state(self)
+        if self.bp != padded_batch(self.max_batch):
+            self.bp = padded_batch(self.max_batch)
+            ttnn.deallocate(self.gconst)
+            self.gconst = self._make_gconst()
+        self.batch, self.seq_ids = self.max_batch, list(range(self.max_batch))
+
+    def retire(self, rows):
+        """Sequences leave the batch: `rows` are their rows in the current batch (any subset). The others keep their
+        states and move up, in order, to rows 0..B'-1 (seq_ids follows them); later steps take B' rows and run the
+        program of B'. Returns B' (0 once every sequence has left). A traced step has to be captured again."""
+        drop = set(rows)
+        assert all(0 <= r < self.batch for r in drop), "rows of the current batch"
+        keep = [r for r in range(self.batch) if r not in drop]
+        if keep and drop:
+            self._compact(keep)
+        self.batch, self.seq_ids = len(keep), [self.seq_ids[r] for r in keep]
+        return self.batch
+
+    def _compact(self, keep):
+        """Row keep[i] -> row i in every layer's states, on the device (kernels/compact.cpp), and bp -> the new
+        batch's."""
+        bp = padded_batch(len(keep))
+        # the same on every core (common runtime args, whose count is part of the program hash)
+        args = [self.bp, bp, len(keep), self.gconst.buffer_address(), len(self.layers)] + keep + [0] * (MAX_BATCH - len(keep))
+        for layer in self.layers:
+            args += [layer.rec_state.buffer_address(), layer.conv_state.buffer_address()]
+        scratch = 2 * conv_state_tiles() * padded_batch(self.max_batch) * 64  # the conv state's face rows
+        program = ttnn.ProgramDescriptor(
+            kernels=[ttnn.KernelDescriptor(
+                kernel_source=self.kernels["compact"], source_type=ttnn.KernelDescriptor.SourceType.SOURCE_CODE,
+                core_ranges=self.cores, common_runtime_args=args, config=ttnn.ReaderConfigDescriptor(),
+            )],
+            semaphores=[],
+            cbs=[ttnn.CBDescriptor(total_size=scratch, core_ranges=self.cores,
+                                   format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.float32, 64)])],
+        )
+        states = [t for layer in self.layers for t in (layer.rec_state, layer.conv_state)]
+        ttnn.generic_op(states + [self.gconst], program)
+        self.bp = bp
 
     def get_recurrent_state(self, i):
         """[B, 16, 128, 128] copy of layer i's L1 state (for checks)."""
         B = self.batch
-        x = ttnn.to_torch(self.layers[i].rec_state).reshape(self.nh, GROUP, B, self.dk, TILE)
+        x = ttnn.to_torch(self.layers[i].rec_state).reshape(self.nh, GROUP, self.max_batch, self.dk, TILE)[:, :, :B]
         return x.permute(2, 0, 3, 1, 4).reshape(B, self.nh, self.dk, self.dk)
 
     # ---- program --------------------------------------------------------------------------------
@@ -253,9 +305,12 @@ class Qwen35_08B_GDNStackL1:
                 ttnn.CBFormatDescriptor(C_YG, ttnn.float32, y_page, y_tile),
             ],
         ))
+        conv = ttnn.cb_descriptor_from_sharded_tensor(C_CONV, layer.conv_state)  # sized for max_batch: the current
+        conv.total_size = conv_state_tiles() * y_page                               # bp's tiles are at its start
+        conv.format_descriptors = [ttnn.CBFormatDescriptor(C_CONV, ttnn.float32, y_page, y_tile)]
         cbs += [
             ttnn.cb_descriptor_from_sharded_tensor(C_STATE, layer.rec_state),
-            ttnn.cb_descriptor_from_sharded_tensor(C_CONV, layer.conv_state),
+            conv,
             ttnn.cb_descriptor_from_sharded_tensor(C_GCONST, self.gconst),
         ]
         if self.weights_in_dram:  # streaming buffers instead of resident tensors
@@ -275,7 +330,7 @@ class Qwen35_08B_GDNStackL1:
 
     def _kernels(self, li, x, out):
         layer, B = self.layers[li], self.batch
-        reader_ct = [B, 3, self.bp, 4, 0]
+        reader_ct = [self.bp, 3, 4]
         if self.weights_in_dram:
             reader_ct += [tile_bytes(self.weight_dtype)]
             for t in (layer.w_in, layer.w_out, layer.lconst):
@@ -292,7 +347,7 @@ class Qwen35_08B_GDNStackL1:
             first, last = self.noc_xy[half * N_HALF], self.noc_xy[(half + 1) * N_HALF - 1]
             half_rect = [first.x, first.y, last.x, last.y]  # this core's half of the grid (also its coordinator)
             partner = self.noc_xy[c ^ N_HALF]  # same output tile, other half
-            reader_rt[core.x][core.y] = [c] + half_rect + (
+            reader_rt[core.x][core.y] = [c, B] + half_rect + (
                 [layer.w_in.buffer_address(), layer.w_out.buffer_address(), layer.lconst.buffer_address()]
                 if self.weights_in_dram else [])
             writer_rt[core.x][core.y] = ([out.buffer_address(), B, c] + group + half_rect + [partner.x, partner.y]
@@ -300,7 +355,7 @@ class Qwen35_08B_GDNStackL1:
             compute_rt[core.x][core.y] = [
                 f32_bits(layer.dt_bias[h]), f32_bits(layer.neg_A[h]),
                 f32_bits(scale2), f32_bits(1e-6 * scale2), f32_bits(1e-6),
-                f32_bits(1.0 / self.dk), f32_bits(layer.norm_eps), c,
+                f32_bits(1.0 / self.dk), f32_bits(layer.norm_eps), c, B,
             ]
 
         def kernel(name, ct, rt, config):
@@ -317,11 +372,11 @@ class Qwen35_08B_GDNStackL1:
         return [
             kernel("reader", reader_ct, reader_rt, ttnn.ReaderConfigDescriptor()),
             kernel("writer", writer_ct, writer_rt, ttnn.WriterConfigDescriptor()),
-            kernel("compute", [B, self.bp], compute_rt, compute_cfg),
+            kernel("compute", [self.bp], compute_rt, compute_cfg),
         ]
 
     def _program(self, li, x, out):
-        key = (li, x.buffer_address(), out.buffer_address())
+        key = (li, x.buffer_address(), out.buffer_address(), self.batch)
         kernels = self._kernel_cache.get(key)
         if kernels is None:
             kernels = self._kernel_cache[key] = self._kernels(li, x, out)
@@ -331,6 +386,7 @@ class Qwen35_08B_GDNStackL1:
     def forward_device(self, x, layers=None, keep_input=False):
         """x: [32, 1024] fp32 L1 tensor holding this step's input in the face-major layout (see to_face_major).
         Runs the layers in order; the output uses the same layout."""
+        assert self.batch > 0, "every sequence has left the batch"
         for n, li in enumerate(range(len(self.layers)) if layers is None else layers):
             out = ttnn.allocate_tensor_on_device(
                 ttnn.Shape([MAX_BATCH, self.hidden]), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, self.device,
@@ -355,6 +411,7 @@ class Qwen35_08B_GDNStackL1:
     def forward_into(self, x, outs):
         """Like forward_device, but writes layer i into the preallocated outs[i] and frees nothing, so a
         whole decode step can be captured once with ttnn.begin_trace_capture and replayed."""
+        assert self.batch > 0, "every sequence has left the batch"
         for li, out in enumerate(outs):
             ttnn.generic_op([x, self.layers[li].w_in, out], self._program(li, x, out))
             x = out
@@ -364,11 +421,14 @@ class Qwen35_08B_GDNStackL1:
         """One decode step. hidden_states: [batch, 1024] (or [batch, 1, 1024]) torch -> same shape.
 
         Continues from the L1 states and applies the selected layers one after another (GDN mixers
-        only: no norms, residuals or MLP)."""
+        only: no norms, residuals or MLP). Row b is the sequence seq_ids[b]; after every sequence has left
+        (batch 0), the input and output are empty."""
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
         B, H = x.shape
         assert B == self.batch and H == self.hidden, "one token per sequence per call"
+        if B == 0:
+            return torch.empty_like(hidden_states)
         xd = ttnn.from_torch(to_face_major(x, self.bp), dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT,
                              device=self.device, memory_config=ttnn.L1_MEMORY_CONFIG)
         y = self.forward_device(xd, layers)

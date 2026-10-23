@@ -86,13 +86,41 @@ data: value (row r, column `32k + 16h + e`) at word `((2k + h) * BP + r) * 16 + 
 rows of one face are one contiguous `BP x 64 B` block, so moving a tile's batch costs 2 transfers whatever
 the batch, and the two blocks of tile k are adjacent: the input is already a sequence of `BP x 32` tiles.
 
-**Only the batch rows.** Every activation has its B sequences in rows 0..B-1 (B <= 16). The matrix unit
-reads `BP x 32` tiles where an operand is a batch-row activation (the in_proj input, the conv state, the
-gathered y), which cuts
-its MVMULs and source data; the vector unit (SFPU) touches only the rows that matter. Measured on the card:
-in a face, SFPU row `i` (`dst_reg[i]`) holds tile rows `4 (i/2) .. 4 (i/2) + 3` at the even (`i` even) or odd
-columns, and a tile is 32 SFPU rows, so the per-row scalars (column 0 of rows 0..B-1) are `ceil(B/4)` SFPU
-rows instead of 32 per tile, and the SiLUs need `2 ceil(B/4)` per face of the top two faces.
+**Only the batch rows.** Every activation has its B sequences in rows 0..B-1 (B <= 16; rows B..BP-1 are
+zero padding). The matrix unit reads `BP x 32` tiles where an operand is a batch-row activation (the in_proj
+input, the conv state, the gathered y), which cuts its MVMULs and source data; the vector unit (SFPU) touches
+only the rows that matter. Measured on the card: in a face, SFPU row `i` (`dst_reg[i]`) holds tile rows
+`4 (i/2) .. 4 (i/2) + 3` at the even (`i` even) or odd columns, and a tile is 32 SFPU rows, so the per-row
+scalars (column 0 of rows 0..BP-1) are `ceil(BP/4)` SFPU rows instead of 32 per tile, and the SiLUs need
+`2 ceil(BP/4)` per face of the top two faces.
+
+### Shrinking batch
+
+Sequences finish at different steps (random lengths, any order), so the batch can drop from 16 to anything
+down to 0. The stack keeps the states of the batch it was built with, and `retire(rows)` drops finished rows:
+
+- **One program per padded batch.** The kernels take B as a runtime argument and only BP at compile time, so
+  there are 5 programs (BP = 1, 2, 4, 8, 16), and a smaller B with the same BP reuses its program with new
+  arguments. The SFPU passes cover the BP rows (the zero padding stays finite), and the recurrence and its
+  per-token inputs run for rows 0..B-1 only.
+- **States moved up on the device** ([`kernels/compact.cpp`](kernels/compact.cpp), one launch per `retire`): on
+  every core and for every layer, the remaining sequences move up, in order, to rows 0..B'-1. Recurrent-state
+  slots (16 KB) are copied one at a time, since a later copy can overwrite an earlier one's source. The conv
+  state goes from BP-row to BP'-row face blocks through a scratch buffer, with the padding rows zeroed. The
+  group-sum selector of the global constants is rewritten for BP'. The state buffers stay allocated for the
+  full batch; the conv CB is a `BP' x 32`-tile view of the start of its buffer.
+- **Cost**: 2-13 us on the device per `retire` (more slots to move, longer), ~0.1 ms on the host. A captured
+  trace has to be captured again; `bench_shrink.py` replays one trace per stretch of constant batch.
+- **Program cache pitfall.** The generic op's program cache key counts the cores that have runtime arguments,
+  not how many arguments each core has. Two compaction programs that differed only in their number of per-core
+  arguments (one argument pair per layer) shared a key, and the second ran with the first one's arguments. The
+  compaction kernel takes common runtime arguments, whose count is part of the key.
+
+Layer time per launch at every batch (bfp8, device profiler, median of 100 launches):
+
+| B | 16 | 13 | 10 | 8 | 5 | 4 | 3 | 2 | 1 |
+|---|---|---|---|---|---|---|---|---|---|
+| layer | 97.1 us | 89.1 | 81.3 | 60.1 | 52.1 | 42.4 | 39.8 | 35.2 | 32.1 |
 
 ## 3. How the matrix multiplications are done
 
@@ -270,7 +298,10 @@ y gather grow with the bytes moved (4 KB per sequence each); the rest hardly dep
 
 Kernel error, against HF with the same (quantised) weights: **0.36-0.39%, PCC 0.999998+**, for batch 1,
 3, 4, 8, 16 (batch 3 checks the non-power-of-2 padding), and with 2 / 3 / 6 layers resident at once,
-8 decode steps from zero state, in both weight modes (all 11 tests of `test_gdn_l1.py`). Over 32 decode steps:
+8 decode steps from zero state, in both weight modes. With a shrinking batch (16 -> 10 -> 8 -> 5 -> 3 -> 2 ->
+1 -> 0; 16 -> 15 -> 0 and again after reset_state(); 16 sequences with random lengths up to 24 tokens,
+1 bfp8 / 2 bfp4 layers): at most 0.44% at every
+step, PCC 0.999998+ (all 15 tests of `test_gdn_l1.py`). Over 32 decode steps:
 0.38% at batch 1 and 0.40% at batch 8, the same at the last step as overall (no drift). in_proj at HiFi3
 instead of HiFi4: 0.40% vs 0.39% (32 steps); HiFi2 would be 1.1%. Total error against HF with the model's
 bf16 weights (measured before round 2): bf16 0.5%, bfp8 1.26% (PCC 0.99994), bfp4 17.6% (too lossy).
@@ -363,8 +394,10 @@ GDN mixer) around the mixer.
 |---|---|
 | `gdn_l1.py` | `Qwen35_08B_GDNStackL1`: weight split, L1 tensors, activation layout, decode / traced decode |
 | `kernels/reader.cpp`, `compute.cpp`, `writer.cpp` | the fused per-core layer kernel (profiler zones per phase) |
-| `test_gdn_l1.py` | decode tests vs HF, batch 1-16, L1 and DRAM weight modes |
+| `kernels/compact.cpp` | moves the remaining sequences' states up when the batch shrinks |
+| `test_gdn_l1.py` | decode tests vs HF, batch 1-16, shrinking batch, L1 and DRAM weight modes |
 | `bench_decode.py` | 500-step decode, L1 vs DRAM, plain dispatch and traced |
+| `bench_shrink.py` | 16 sequences finishing at random steps, batch 16 -> 0, traced per stretch |
 | `bench_energy.py` | power sampling and energy per token |
 | `profile_layer.py` | device time of one layer launch per phase and per core, from the profiler zones |
 | `REPORT.md` | short report: the layer, the split, the optimizations with file pointers, results, energy |

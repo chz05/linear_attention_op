@@ -92,6 +92,63 @@ def test_decode_resident_layers(device, n_layers, B, dtype):
         check(f"decode {n_layers} resident layers {dtype} B={B}, layer {i}", got[i], want[i])
 
 
+def run_shrinking(device, n_layers, weight_dtype, lengths, seed=2, rounds=1):
+    """A batch of len(lengths) sequences decoding together; sequence s finishes after lengths[s] tokens, and the
+    batch shrinks as sequences finish (retire), down to 0. Each step's rows must match HF run on that sequence's
+    own tokens. With rounds > 1 the stack is reset (full batch, zero states) and runs it again. Returns the batch
+    sizes seen, one per step."""
+    steps = max(lengths)
+    hf = make_hf_layers(n_layers, seed=seed, weight_dtype=weight_dtype, device=device)
+    x = torch.randn(len(lengths), steps, 1024).bfloat16().float()
+    with torch.no_grad():
+        want = [L(x) for L in hf]
+    tt = Qwen35_08B_GDNStackL1(device, hf, batch=len(lengths), weight_dtype=weight_dtype)
+    for n in range(rounds):
+        if n > 0:
+            tt.reset_state()
+        sizes = []
+        for t in range(steps + 1):
+            done = [r for r, s in enumerate(tt.seq_ids) if lengths[s] == t]
+            tt.retire(done[::-1] if t % 2 else done)  # any order
+            assert tt.seq_ids == [s for s in range(len(lengths)) if lengths[s] > t]
+            ids = tt.seq_ids
+            if not ids:
+                assert tt(torch.zeros(0, 1024)).shape == (0, 1024)
+                break
+            sizes.append(len(ids))
+            for i in range(n_layers):
+                check(f"round {n} step {t} B={len(ids)} layer {i}", tt(x[ids, t], layers=[i]), want[i][ids, t])
+        assert tt.batch == 0
+    return sizes
+
+
+def test_decode_shrinking_batch(device):
+    """16 -> 10 -> 8 -> 5 -> 3 -> 2 -> 1 -> 0, with random sequences finishing at each step down."""
+    sizes = [16, 16, 10, 10, 8, 8, 5, 3, 3, 2, 1, 1]
+    order = torch.randperm(16, generator=torch.Generator().manual_seed(5)).tolist()  # finishing order
+    lengths = [0] * 16
+    for t, b in enumerate(sizes + [0]):
+        for s in order[b:]:
+            lengths[s] = lengths[s] or t
+    assert run_shrinking(device, 1, ttnn.bfloat8_b, lengths) == sizes
+
+
+def test_decode_shrinking_batch_to_zero(device):
+    """16 for 3 steps, one sequence finishes (15), then the other 15 all finish at once (15 -> 0); then the stack is
+    reset to a fresh batch of 16 and the same happens again."""
+    lengths = [8] * 16
+    lengths[6] = 3
+    assert run_shrinking(device, 1, ttnn.bfloat8_b, lengths, rounds=2) == [16] * 3 + [15] * 5
+
+
+@pytest.mark.parametrize("n_layers, dtype, seed", [(1, ttnn.bfloat8_b, 11), (2, ttnn.bfloat4_b, 12)])
+def test_decode_shrinking_batch_random(device, n_layers, dtype, seed):
+    """Every sequence of a batch of 16 finishes after a random number of tokens."""
+    lengths = torch.randint(1, 25, (16,), generator=torch.Generator().manual_seed(seed)).tolist()
+    sizes = run_shrinking(device, n_layers, dtype, lengths, seed=seed)
+    print("batch per step:", sizes)
+
+
 @pytest.mark.parametrize("dtype", [ttnn.bfloat16, ttnn.bfloat8_b])
 def test_decode_weights_in_dram(device, dtype):
     """Comparison mode: same kernel, weights streamed from DRAM every step."""

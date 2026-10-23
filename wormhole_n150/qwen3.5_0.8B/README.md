@@ -9,8 +9,10 @@ Model (from `Qwen/Qwen3.5-0.8B` config.json): 24 layers, 18 GDN + 6 full attenti
 15, 19, 23); hidden 1024, 16 k-heads, 16 v-heads, dk = dv = 128, conv kernel 4. This code covers the
 GDN mixer only (no input RMSNorm, residual or MLP).
 
-**See [OPTIMIZATION.md](OPTIMIZATION.md)** for the weight split, how the matmuls are done, both
-optimization rounds, the per-batch breakdown, all metrics and next ideas.
+**See [REPORT.md](REPORT.md)** for a short report (the layer, the split over the cores, the optimizations
+with pointers into the code, results and energy) and **[OPTIMIZATION.md](OPTIMIZATION.md)** for the
+details: how the matmuls are done, all three optimization rounds, per-phase breakdowns, all metrics and
+next ideas.
 
 ## Usage
 
@@ -31,30 +33,36 @@ cd wormhole_n150/qwen3.5_0.8B
 python -m pytest -s test_gdn_l1.py     # vs Hugging Face, batch 1-16, L1 and DRAM weight modes
 python bench_decode.py                 # 500 decode steps, weights in L1 vs DRAM
 python bench_energy.py                 # tokens/s, board power, energy per token
+python profile_layer.py                # device time per phase and per core (sets TT_METAL_DEVICE_PROFILER)
 ```
 
 ## Design in one paragraph
 
 Core c (8x8 grid) owns head `c // 4` and a quarter of its v columns. Its L1 holds its in_proj slice
-(`[q/4 | k/4 | v/4 | z/4 | a,b]`, 1024 x 160), its 32 rows of out_proj (with the RMSNorm weight folded in),
-its conv taps and, per sequence, its slice of the recurrent and conv state. One fused kernel per layer
-runs in_proj, conv, a q/k quarter swap inside the head's 4 cores, the norms and gating, the recurrence
-(state updated in place) and the gated RMSNorm, then a partial out_proj whose 64 partials are
-reduce-scattered to 32 owner cores. Activations use a face-major layout so a tile's batch rows always move
-in 2 transfers.
+(`[q/4 | k/4 | v/4 | z/4 | a,b]`, 1024 x 160), its conv taps, its out_proj slice (the 1024 v channels of
+its half of the grid for output columns `32 (c % 32) ..`, RMSNorm weight folded in) and, per sequence, its
+slice of the recurrent and conv state. One fused kernel per layer runs in_proj (reading the multicast input
+in place as batch-row tiles), the conv (reading its state in place), an exchange of the l2-norm partial sums
+inside the head's 4 cores, the gates, a swap of the row-scaled q/k quarters, the recurrence (state updated
+in place) and the gated RMSNorm, then out_proj: y is gathered within each half of the grid by one
+coordinator, every core computes one output tile over its half's channels, and cores c and c ^ 32 add their
+two partials. Vector-unit (SFPU) work only touches the batch rows, and only the batch rows travel between
+cores.
 
 ## Results (n150, tt-metal v0.77)
 
 | | Batch 1 | Batch 4 | Batch 8 | Batch 16 |
 |---|---|---|---|---|
-| Layer time on chip (bfp8, profiler) | **71 us** | 91 us | 117 us | 171 us |
-| bfp8 layers that fit in L1 | 3 | 3 | 2 | 1 |
+| Layer time on chip (bfp8, profiler) | **32.0 us** (was 71.0) | 42.5 us (90.7) | 60.6 us (117.1) | 96.7 us (171.2) |
+| bfp8 layers that fit in L1 | 4 (was 3) | 3 | 2 | 1 |
 
-- **Accuracy**: 0.38-0.41% vs Hugging Face with the same weights (PCC 0.999999); bfp8 weights add ~1%
+- **Accuracy**: 0.36-0.39% vs Hugging Face with the same weights (PCC 0.999998+); bfp8 weights add ~1%
   vs the model's bf16 weights, bfp4 is too lossy (17.6%).
-- **L1 vs DRAM weights** (500 traced steps): 1.8x faster with bfp8 at batch 1 (74 vs 134 us/layer), 2.6x
-  with bf16, 1.37x at batch 8.
-- **Energy**: 23-52% less energy per token with weights in L1; 95 tokens/J for 3 bfp8 layers at batch 1,
-  581 tokens/J for 2 layers at batch 8.
+- **Traced decode** (500 steps): 33 us/layer for 3 bfp8 layers at batch 1 (99 us/step, was 74 us/layer),
+  64 us/layer for 2 layers at batch 8 (was 122); 4 resident bfp8 layers: 130 us/step at batch 1.
+- **L1 vs DRAM weights**: 2.9x faster with bfp8 at batch 1 (33 vs 97 us/layer), 4.7x with bf16, 1.9x at
+  batch 8.
+- **Energy**: 40-70% less energy per token with weights in L1; 214 tokens/J for 3 bfp8 layers at batch 1
+  (was 95), 1,100 tokens/J for 2 layers at batch 8 (was 581).
 
-Details and the full tables are in [OPTIMIZATION.md](OPTIMIZATION.md).
+Details and the full tables are in [REPORT.md](REPORT.md) and [OPTIMIZATION.md](OPTIMIZATION.md).
